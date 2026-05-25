@@ -53,4 +53,10 @@ QUERY="${QUERY#&}"
 URL="${BASE_URL}/parse"
 [[ -n "$QUERY" ]] && URL="${URL}?${QUERY}"
 
-curl -fsS -X POST "$URL" -F "file=@${FILE}"
+if [[ $MD_FLAG -eq 1 ]]; then
+  OUT="${FILE%.*}.md"
+  curl -fsS -X POST "$URL" -F "file=@${FILE}" -o "$OUT"
+  echo "Salvato: $OUT" >&2
+else
+  curl -fsS -X POST "$URL" -F "file=@${FILE}"
+fi

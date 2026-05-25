@@ -34,21 +34,25 @@ from fastapi.responses import JSONResponse, Response
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions
+from docling_core.types.doc.base import ImageRefMode
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── Configurazione da environment ─────────────────────────────────────────────
 
-_MAX_CONCURRENT = int(os.environ.get("DOCLING_MAX_CONCURRENT", 1))
-_NUM_THREADS    = int(os.environ.get("DOCLING_THREADS", max(2, (os.cpu_count() or 4) // _MAX_CONCURRENT)))
-_TIMEOUT_SEC    = int(os.environ.get("DOCLING_TIMEOUT_SEC", 300))
-_MAX_FILE_MB    = int(os.environ.get("DOCLING_MAX_FILE_MB", 100))
-_DEVICE_STR     = os.environ.get("DOCLING_DEVICE", "cpu").lower()
+_MAX_CONCURRENT            = int(os.environ.get("DOCLING_MAX_CONCURRENT", 1))
+_NUM_THREADS               = int(os.environ.get("DOCLING_THREADS", max(2, (os.cpu_count() or 4) // _MAX_CONCURRENT)))
+_TIMEOUT_SEC               = int(os.environ.get("DOCLING_TIMEOUT_SEC", 300))
+_MAX_FILE_MB               = int(os.environ.get("DOCLING_MAX_FILE_MB", 100))
+_DEVICE_STR                = os.environ.get("DOCLING_DEVICE", "cpu").lower()
+_GENERATE_PAGE_IMAGES      = os.environ.get("DOCLING_GENERATE_PAGE_IMAGES", "false").lower() == "true"
+_GENERATE_PICTURE_IMAGES   = os.environ.get("DOCLING_GENERATE_PICTURE_IMAGES", "false").lower() == "true"
 
 logger.info(
-    "Docling config: threads=%d, max_concurrent=%d, timeout=%ds, max_file=%dMB, device=%s",
+    "Docling config: threads=%d, max_concurrent=%d, timeout=%ds, max_file=%dMB, device=%s, page_images=%s, picture_images=%s",
     _NUM_THREADS, _MAX_CONCURRENT, _TIMEOUT_SEC, _MAX_FILE_MB, _DEVICE_STR,
+    _GENERATE_PAGE_IMAGES, _GENERATE_PICTURE_IMAGES,
 )
 
 
@@ -61,8 +65,8 @@ def _make_converter(do_ocr: bool = False, do_table_structure: bool = False) -> D
     opts = PdfPipelineOptions()
     opts.do_ocr = do_ocr
     opts.do_table_structure = do_table_structure
-    opts.generate_page_images = False
-    opts.generate_picture_images = False
+    opts.generate_page_images = _GENERATE_PAGE_IMAGES
+    opts.generate_picture_images = _GENERATE_PICTURE_IMAGES
     opts.accelerator_options = AcceleratorOptions(
         num_threads=_NUM_THREADS,
         device=_DEVICE_STR,
@@ -100,7 +104,7 @@ def _convert_in_worker(tmp_path: str, do_ocr: bool, do_table_structure: bool, ma
     doc = result.document
     return {
         "docling_json": doc.export_to_dict(),
-        "markdown": doc.export_to_markdown(),
+        "markdown": doc.export_to_markdown(image_mode=ImageRefMode.EMBEDDED),
     }
 
 
