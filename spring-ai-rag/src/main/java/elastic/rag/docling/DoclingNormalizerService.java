@@ -47,6 +47,11 @@ public class DoclingNormalizerService {
             log.warn("Nessun elemento 'texts' trovato nel JSON Docling");
             return Collections.emptyList();
         }
+        log.info("[NORMALIZER] totale elementi texts da processare: {}", texts.size());
+        Map<String, Long> labelCounts = texts.stream()
+                .collect(java.util.stream.Collectors.groupingBy(
+                        t -> String.valueOf(t.get("label")), java.util.stream.Collectors.counting()));
+        log.info("[NORMALIZER] distribuzione label: {}", labelCounts);
 
         List<DocumentSection> sections = new ArrayList<>();
         int sectionIndex = 0;
@@ -101,14 +106,18 @@ public class DoclingNormalizerService {
     }
 
     private DocumentSection buildSection(int index, String title, Integer page, String text) {
-        return new DocumentSection(
+        DocumentSection section = new DocumentSection(
                 "section-" + index,
                 title,
                 page,
-                null,        // startTimeMs — riservato ai video
-                null,        // endTimeMs   — riservato ai video
+                null,
+                null,
                 text,
-                Map.of()     // metadata aggiuntivi aggiunti dallo step successivo
+                Map.of()
         );
+        log.info("[NORMALIZER] sezione built \u2014 id={} title='{}' page={} textLen={}",
+                section.sectionId(), section.title(), section.pageNumber(),
+                text != null ? text.length() : 0);
+        return section;
     }
 }

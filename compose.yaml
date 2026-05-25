@@ -1,13 +1,72 @@
 services:
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.3
+    environment:
+      - node.name=elasticsearch
+      - cluster.name=docker-cluster
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - xpack.ml.enabled=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    networks:
+      - elastic
+    restart: unless-stopped
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.3
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    networks:
+      - elastic
+    depends_on:
+      - elasticsearch
+    restart: unless-stopped
+
   docling-service:
     build:
       context: ./docling-service
+      dockerfile: Dockerfile
     ports:
       - "8001:8001"
+    networks:
+      - elastic
     environment:
-      DOCLING_THREADS: "${DOCLING_THREADS:-4}"
-      DOCLING_MAX_CONCURRENT: "${DOCLING_MAX_CONCURRENT:-2}"
-      DOCLING_TIMEOUT_SEC: "${DOCLING_TIMEOUT_SEC:-600}"
-      DOCLING_MAX_FILE_MB: "${DOCLING_MAX_FILE_MB:-100}"
-      DOCLING_DEVICE: "${DOCLING_DEVICE:-cpu}"
+      - DOCLING_THREADS=${DOCLING_THREADS:-12}
+      - DOCLING_MAX_CONCURRENT=${DOCLING_MAX_CONCURRENT:-1}
+      - DOCLING_TIMEOUT_SEC=${DOCLING_TIMEOUT_SEC:-900}
+      - DOCLING_MAX_FILE_MB=${DOCLING_MAX_FILE_MB:-100}
+      - DOCLING_DEVICE=${DOCLING_DEVICE:-cpu}
+    deploy:
+      resources:
+        limits:
+          memory: 8g
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     restart: unless-stopped
+
+volumes:
+  elasticsearch-data:
+    driver: local
+
+networks:
+  elastic:
+    driver: bridge
