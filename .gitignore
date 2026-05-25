@@ -1,9 +1,6 @@
 # Modelli HuggingFace (troppo grandi per git)
 docling-service/hf-models/
 
-# PDF di esempio/test
-esempi/
-
 # Python
 __pycache__/
 *.pyc
