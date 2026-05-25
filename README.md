@@ -1,0 +1,131 @@
+# spring-ai-architecture
+
+Sistema **RAG (Retrieval-Augmented Generation)** completamente locale: nessun servizio cloud, nessuna API key. I documenti vengono analizzati, vettorializzati e interrogati in linguaggio naturale usando modelli LLM che girano sulla macchina.
+
+---
+
+## Panoramica
+
+```
+                        ┌──────────────────────────────┐
+                        │         Client / curl         │
+                        └──────────┬───────────────────┘
+                                   │ POST /docling/parse
+                                   │ GET  /docling/ask
+                                   ▼
+                   ┌───────────────────────────────┐
+                   │        spring-ai-rag           │
+                   │     (Spring Boot 3 / Java)     │
+                   │                               │
+                   │  • riceve il file             │
+                   │  • chiama Docling             │
+                   │  • normalizza le sezioni      │
+                   │  • chunking + overlap         │
+                   │  • embedding → Elasticsearch  │
+                   │  • kNN search + LLM answer    │
+                   └────┬──────────────┬───────────┘
+                        │              │
+           POST /parse  │              │  embedding + kNN
+                        ▼              ▼
+          ┌─────────────────┐   ┌──────────────────┐
+          │ docling-service │   │  Elasticsearch   │
+          │  (FastAPI/Python│   │  (vector store)  │
+          │   IBM Docling)  │   │  768 dimensioni  │
+          └─────────────────┘   └──────────────────┘
+                                        │
+                              ┌─────────┴──────────┐
+                              │       Ollama        │
+                              │  nomic-embed-text   │
+                              │  llama3.2:3b        │
+                              └─────────────────────┘
+```
+
+---
+
+## Componenti
+
+### `docling-service/`
+Microservizio Python (FastAPI) che espone `POST /parse`.  
+Riceve un file (PDF, DOCX, HTML, PPTX…), lo elabora con **Docling** (IBM) e restituisce il documento in formato JSON strutturato con testi, tabelle e metadati di layout.  
+Supporta OCR opzionale, rilevamento struttura tabelle e limite pagine.
+
+### `spring-ai-rag/`
+Applicazione Spring Boot che orchestra l'intera pipeline RAG:
+- **Ingestione**: riceve il PDF → lo invia a Docling → normalizza le sezioni → splitta in chunk con overlap → calcola embedding → salva su Elasticsearch
+- **Interrogazione**: riceve una domanda → embedding → kNN search → costruisce il contesto → genera la risposta con l'LLM
+
+### `compose.yaml`
+Docker Compose con tutti i servizi infrastrutturali:
+
+| Servizio | Porta | Descrizione |
+|---|---|---|
+| Elasticsearch 8.11 | 9200 | Vector store, indice `spring-ai-document-index` |
+| Kibana 8.11 | 5601 | UI per esplorare i chunk indicizzati |
+| docling-service | 8001 | Parsing documenti |
+
+> Ollama gira come processo host separato (`localhost:11434`).
+
+---
+
+## Avvio rapido
+
+```bash
+# 1. Avvia i servizi
+docker compose up -d
+
+# 2. Scarica i modelli Ollama (una tantum)
+ollama pull nomic-embed-text
+ollama pull llama3.2:3b
+
+# 3. Avvia l'app Spring
+cd spring-ai-rag
+export ELASTICSEARCH_PASSWORD=changeme
+./start.sh
+
+# 4. Carica un documento
+./upload-pinocchio.sh
+
+# 5. Fai una domanda
+./upload-pinocchio.sh ask "chi è Geppetto?"
+```
+
+---
+
+## Formato dati interno
+
+Tutti i documenti transitano nel formato `UnifiedDocumentJson`, indipendente dalla sorgente:
+
+```json
+{
+  "docId": "uuid",
+  "fileName": "pinocchio.pdf",
+  "sourceType": "PDF",
+  "sections": [
+    {
+      "sectionId": "section-0",
+      "title": "CAPITOLO 1",
+      "pageNumber": 5,
+      "text": "..."
+    }
+  ]
+}
+```
+
+Questo contratto permette di aggiungere in futuro altri tipi di sorgente (video con trascrizione, DOCX, HTML) senza modificare il layer di embedding e retrieval.
+
+---
+
+## Struttura repository
+
+```
+spring-ai-architecture/
+├── compose.yaml            # Infrastruttura Docker
+├── docling-service/        # Microservizio parsing (Python/FastAPI)
+│   ├── main.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── spring-ai-rag/          # App principale Spring Boot (RAG)
+│   └── src/…
+├── esempi/                 # PDF di test (non in git)
+└── upload-pinocchio.sh     # Script curl per test rapido
+```
