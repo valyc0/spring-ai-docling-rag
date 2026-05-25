@@ -1,6 +1,9 @@
 # Modelli HuggingFace (troppo grandi per git)
 docling-service/hf-models/
 
+# Residui directory rinominate
+rag-spring-ai-example/
+
 # Python
 __pycache__/
 *.pyc

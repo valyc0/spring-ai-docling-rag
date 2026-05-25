@@ -1,5 +1,7 @@
 package elastic.rag.docling;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import elastic.rag.model.DoclingResponse;
 import elastic.rag.model.UnifiedDocumentJson;
 import org.slf4j.Logger;
@@ -34,6 +36,7 @@ import java.util.UUID;
 public class DoclingController {
 
     private static final Logger log = LoggerFactory.getLogger(DoclingController.class);
+    private static final ObjectMapper JSON = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
 
     /** Dimensione chunk in token (nomic-embed-text: contex 8192, usiamo 400 per lasciare spazio all'overlap) */
     private static final int CHUNK_TOKENS   = 400;
@@ -90,6 +93,11 @@ public class DoclingController {
         DoclingResponse doclingResponse = new DoclingResponse(rawMap, null);
         log.info("[DOCLING RAW] chiavi top-level: {}", doclingResponse.doclingJson().keySet());
         log.info("[DOCLING RAW] totale texts: {}", countTexts(doclingResponse));
+        if (log.isDebugEnabled()) {
+            try {
+                log.debug("[DOCLING RAW] JSON completo:\n{}", JSON.writeValueAsString(doclingResponse.doclingJson()));
+            } catch (Exception e) { log.warn("Impossibile serializzare JSON Docling", e); }
+        }
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> rawTexts = (List<Map<String, Object>>) doclingResponse.doclingJson().get("texts");
         if (rawTexts != null) {
@@ -101,6 +109,11 @@ public class DoclingController {
         String docId = UUID.randomUUID().toString();
         UnifiedDocumentJson unified = normalizer.normalize(doclingResponse, docId, originalName);
         log.info("[UNIFIED] {} sezioni per docId={}", unified.sections().size(), docId);
+        if (log.isDebugEnabled()) {
+            try {
+                log.debug("[UNIFIED] JSON trasformato:\n{}", JSON.writeValueAsString(unified));
+            } catch (Exception e) { log.warn("Impossibile serializzare UnifiedDocumentJson", e); }
+        }
         unified.sections().forEach(s ->
             log.info("[UNIFIED] sezione idx={} title='{}' page={} textLen={}",
                     s.sectionId(), s.title(), s.pageNumber(),
