@@ -38,6 +38,7 @@ services:
     restart: unless-stopped
 
   docling-service:
+    image: valyc1/docling-service:latest
     build:
       context: ./docling-service
       dockerfile: Dockerfile

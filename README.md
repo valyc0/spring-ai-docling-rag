@@ -129,3 +129,50 @@ spring-ai-architecture/
 ├── esempi/                 # PDF di test (non in git)
 └── upload-pinocchio.sh     # Script curl per test rapido
 ```
+
+---
+
+## Gestione immagine Docker di `docling-service`
+
+Il `compose.yaml` dichiara sia `image` che `build`, così puoi scegliere il comportamento:
+
+```bash
+# Avvia usando l'immagine pubblica dal registry (default)
+docker compose up -d
+
+# Ricostruisce l'immagine dal Dockerfile locale e la tagga come valyc1/docling-service:latest
+docker compose build docling-service
+
+# Ricostruisce e avvia in un solo comando
+docker compose up -d --build docling-service
+```
+
+### Pubblicare una nuova versione su Docker Hub
+
+```bash
+# Ricostruisce dal Dockerfile
+docker compose build docling-service
+
+# Login (una tantum)
+docker login
+
+# Push dell'immagine su Docker Hub
+docker push valyc1/docling-service:latest
+```
+
+---
+
+## Reset completo
+
+Rimuove tutti i container, le immagini e i volumi del progetto (compresi i dati Elasticsearch):
+
+```bash
+docker compose down --volumes --rmi all
+```
+
+Poi per ripartire da zero scaricando tutto dal registry:
+
+```bash
+docker compose up -d
+```
+
