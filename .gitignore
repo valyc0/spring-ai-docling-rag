@@ -1,0 +1,30 @@
+# Modelli HuggingFace (troppo grandi per git)
+docling-service/hf-models/
+
+# PDF di esempio/test
+esempi/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Docker
+.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -13,8 +13,18 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Pre-download dei modelli Docling al build time (evita cold start)
-RUN python -c "from docling.document_converter import DocumentConverter; DocumentConverter()"
-
+# Usa la stessa configurazione di _make_converter() in main.py
+RUN python -c "\
+from docling.document_converter import DocumentConverter, PdfFormatOption; \
+from docling.datamodel.base_models import InputFormat; \
+from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions; \
+opts = PdfPipelineOptions(); \
+opts.do_ocr = False; \
+opts.do_table_structure = False; \
+opts.generate_page_images = False; \
+opts.generate_picture_images = False; \
+opts.accelerator_options = AcceleratorOptions(num_threads=4, device='cpu'); \
+DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)})"
 COPY main.py .
 
 EXPOSE 8001
