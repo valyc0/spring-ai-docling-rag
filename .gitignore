@@ -23,6 +23,9 @@ venv/
 .DS_Store
 Thumbs.db
 
+# Markdown
+*.md
+
 # IDE
 .idea/
 .vscode/
