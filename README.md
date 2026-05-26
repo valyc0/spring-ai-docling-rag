@@ -87,6 +87,9 @@ export ELASTICSEARCH_PASSWORD=changeme
 
 # 5. Fai una domanda
 ./upload-pinocchio.sh ask "chi è Geppetto?"
+
+# 6. Genera e indicizza 10 documenti HTML di test
+./generate-and-index-docs.sh
 ```
 
 ---
@@ -115,6 +118,45 @@ Questo contratto permette di aggiungere in futuro altri tipi di sorgente (video 
 
 ---
 
+## API REST
+
+### Ingestione
+
+```bash
+# Carica e indicizza un file (PDF, HTML, DOCX…)
+POST /docling/parse
+Content-Type: multipart/form-data
+  file=@documento.pdf
+```
+
+### Ricerca vettoriale con filtri
+
+```bash
+# Domanda globale su tutti i documenti
+GET /docling/ask?q=chi+è+Geppetto
+
+# Filtrata per documento specifico
+GET /docling/ask?q=chi+è+Geppetto&docId=<uuid>
+
+# Filtrata per capitolo
+GET /docling/ask?q=importo&docId=<uuid>&chapter=Allegato+A
+
+# Filtri su metadati arbitrari (prefisso meta.)
+GET /docling/ask?q=contratto&meta.sourceType=PDF
+```
+
+Tutti i filtri sono opzionali e combinati in AND tramite `FilterExpressionBuilder` (type-safe, nessuna injection).
+
+### Documenti indicizzati
+
+```bash
+# Lista distinct docId + fileName
+GET /docling/documents
+# → [{"docId":"uuid","fileName":"doc.pdf"}, …]
+```
+
+---
+
 ## Struttura repository
 
 ```
@@ -127,7 +169,10 @@ spring-ai-architecture/
 ├── spring-ai-rag/          # App principale Spring Boot (RAG)
 │   └── src/…
 ├── esempi/                 # PDF di test (non in git)
-└── upload-pinocchio.sh     # Script curl per test rapido
+├── upload-pinocchio.sh     # Carica pinocchio e fa domande RAG
+├── list-docs.sh            # Lista tutti i documenti indicizzati
+├── delete-index.sh         # Cancella l'indice Elasticsearch
+└── generate-and-index-docs.sh  # Genera 10 HTML di test e li indicizza
 ```
 
 ---

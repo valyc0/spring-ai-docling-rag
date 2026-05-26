@@ -4,6 +4,9 @@ docling-service/hf-models/
 # Residui directory rinominate
 rag-spring-ai-example/
 
+# Documenti HTML generati per test
+esempi/test-docs/
+
 # Python
 __pycache__/
 *.pyc
