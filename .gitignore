@@ -36,3 +36,7 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Variabili d'ambiente (contengono segreti)
+.env
+.env.local

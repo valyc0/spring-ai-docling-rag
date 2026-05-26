@@ -152,8 +152,11 @@ public class DoclingController {
                     c.getMetadata().get("pageNumber"),
                     c.getText().length(),
                     truncate(c.getText(), 100)));
+        long embStart = System.currentTimeMillis();
         vectorStore.add(chunks);
-        log.info("[CHUNKS] indicizzati {} chunk su Elasticsearch per docId={}", chunks.size(), docId);
+        long embMs = System.currentTimeMillis() - embStart;
+        log.info("[CHUNKS] indicizzati {} chunk su Elasticsearch per docId={} — embedding+index in {} ms ({} ms/chunk)",
+                chunks.size(), docId, embMs, chunks.isEmpty() ? 0 : embMs / chunks.size());
 
         return ResponseEntity.ok(unified);
     }
@@ -246,9 +249,15 @@ public class DoclingController {
                 .map(Document::getText)
                 .reduce("", (a, b) -> a + "\n---\n" + b);
 
+        if (chunks.isEmpty()) {
+            log.warn("[ASK] nessun chunk trovato per la query — risposta senza contesto evitata");
+            return ResponseEntity.ok("Non ho trovato informazioni rilevanti nei documenti indicizzati per rispondere a questa domanda.");
+        }
+
         String userPrompt = "CONTESTO:\n" + context + "\n\nDOMANDA: " + question;
         log.info("[ASK] prompt utente ({} chars): '{}'", userPrompt.length(), truncate(userPrompt, 300));
 
+        long chatStart = System.currentTimeMillis();
         String answer = chatClient
                 .prompt()
                 .system("""
@@ -260,8 +269,9 @@ public class DoclingController {
                 .user(userPrompt)
                 .call()
                 .content();
+        long chatMs = System.currentTimeMillis() - chatStart;
 
-        log.info("[ASK] risposta AI: '{}'", truncate(answer, 300));
+        log.info("[ASK] risposta AI in {} ms: '{}'", chatMs, truncate(answer, 300));
         return ResponseEntity.ok(answer);
     }
 
