@@ -26,8 +26,10 @@ venv/
 .DS_Store
 Thumbs.db
 
-# Markdown
+# Markdown (escludi i file di documentazione del progetto)
 *.md
+!doc/**/*.md
+!README.md
 
 # IDE
 .idea/
