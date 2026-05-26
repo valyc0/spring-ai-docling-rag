@@ -40,3 +40,7 @@ Thumbs.db
 # Variabili d'ambiente (contengono segreti)
 .env
 .env.local
+
+# Log applicazione
+*.log
+*.log.*.gz
