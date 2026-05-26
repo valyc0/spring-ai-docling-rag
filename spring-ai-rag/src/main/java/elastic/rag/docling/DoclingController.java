@@ -1,8 +1,11 @@
 package elastic.rag.docling;
 
+import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch._types.aggregations.StringTermsBucket;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import elastic.rag.model.DoclingResponse;
+import elastic.rag.model.DocumentInfo;
 import elastic.rag.model.UnifiedDocumentJson;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -11,6 +14,8 @@ import org.springframework.ai.document.Document;
 import org.springframework.ai.transformer.splitter.TokenTextSplitter;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.elasticsearch.ElasticsearchVectorStore;
+import org.springframework.ai.vectorstore.filter.Filter;
+import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.core.io.ByteArrayResource;
@@ -45,19 +50,25 @@ public class DoclingController {
 
     private final RestTemplate             doclingRestTemplate;
     private final String                   doclingUrl;
+    private final String                   vectorStoreIndex;
     private final DoclingNormalizerService normalizer;
     private final ElasticsearchVectorStore vectorStore;
+    private final ElasticsearchClient      esClient;
     private final ChatClient               chatClient;
 
     public DoclingController(RestTemplate doclingRestTemplate,
                              @Value("${docling.service.url}") String doclingUrl,
+                             @Value("${spring.ai.vectorstore.elasticsearch.index-name:spring-ai-document-index}") String vectorStoreIndex,
                              DoclingNormalizerService normalizer,
                              ElasticsearchVectorStore vectorStore,
+                             ElasticsearchClient esClient,
                              ChatClient.Builder chatClientBuilder) {
         this.doclingRestTemplate = doclingRestTemplate;
         this.doclingUrl          = doclingUrl;
+        this.vectorStoreIndex    = vectorStoreIndex;
         this.normalizer          = normalizer;
         this.vectorStore         = vectorStore;
+        this.esClient            = esClient;
         this.chatClient          = chatClientBuilder.build();
     }
 
@@ -148,18 +159,74 @@ public class DoclingController {
     }
 
     /**
-     * GET /docling/ask?q=...
+     * GET /docling/documents
+     * Ritorna la lista distinta di tutti i documenti indicizzati (docId + fileName).
+     * Utile per selezionare un documento prima di chiamare /docling/ask.
+     */
+    @GetMapping("/documents")
+    public ResponseEntity<List<DocumentInfo>> listDocuments() throws IOException {
+        var response = esClient.search(s -> s
+                        .index(vectorStoreIndex)
+                        .size(0)
+                        .aggregations("by_doc", a -> a
+                                .terms(t -> t.field("metadata.docId.keyword").size(10_000))
+                                .aggregations("file_name", a2 -> a2
+                                        .terms(t2 -> t2.field("metadata.fileName.keyword").size(1))
+                                )
+                        ),
+                Void.class);
+
+        List<DocumentInfo> result = new ArrayList<>();
+        for (StringTermsBucket docBucket : response.aggregations()
+                .get("by_doc").sterms().buckets().array()) {
+
+            String docId = docBucket.key().stringValue();
+            List<StringTermsBucket> fileNameBuckets = docBucket.aggregations()
+                    .get("file_name").sterms().buckets().array();
+            String fileName = fileNameBuckets.isEmpty()
+                    ? ""
+                    : fileNameBuckets.get(0).key().stringValue();
+
+            result.add(new DocumentInfo(docId, fileName));
+        }
+
+        log.info("[DOCUMENTS] {} documenti distinti trovati nell'indice '{}'", result.size(), vectorStoreIndex);
+        return ResponseEntity.ok(result);
+    }
+
+    /**
+     * GET /docling/ask?q=...&docId=...&fileName=...&chapter=...&meta.KEY=VALUE...
      * Ricerca RAG sul vector store con risposta generata da LLM.
+     *
+     * Parametri di filtro (tutti opzionali, combinati in AND):
+     *  - docId     : limita la ricerca a un singolo documento
+     *  - fileName  : alternativa a docId quando non si conosce l'id
+     *  - chapter   : limita la ricerca a un capitolo/sezione (campo "title" nei metadati)
+     *  - meta.KEY  : filtro su qualsiasi metadato indicizzato, es. meta.sourceType=PDF
      */
     @GetMapping("/ask")
-    public ResponseEntity<String> ask(@RequestParam("q") String question) {
-        log.info("[ASK] domanda: '{}'", question);
+    public ResponseEntity<String> ask(
+            @RequestParam("q") String question,
+            @RequestParam(value = "docId",    required = false) String docId,
+            @RequestParam(value = "fileName", required = false) String fileName,
+            @RequestParam(value = "chapter",  required = false) String chapter,
+            @RequestParam Map<String, String> allParams) {
 
-        SearchRequest searchRequest = SearchRequest.builder()
+        log.info("[ASK] domanda: '{}' | docId={} fileName={} chapter={}", question, docId, fileName, chapter);
+
+        Filter.Expression filter = buildFilter(docId, fileName, chapter, allParams);
+
+        SearchRequest.Builder reqBuilder = SearchRequest.builder()
                 .query(question)
                 .topK(8)
-                .similarityThreshold(0.0)
-                .build();
+                .similarityThreshold(0.0);
+
+        if (filter != null) {
+            reqBuilder.filterExpression(filter);
+            log.info("[ASK] filtro attivo: {}", filter);
+        }
+
+        SearchRequest searchRequest = reqBuilder.build();
         log.info("[ASK] query Elasticsearch — topK={} threshold={} query='{}'",
                 searchRequest.getTopK(), searchRequest.getSimilarityThreshold(), question);
 
@@ -196,6 +263,38 @@ public class DoclingController {
 
         log.info("[ASK] risposta AI: '{}'", truncate(answer, 300));
         return ResponseEntity.ok(answer);
+    }
+
+    /**
+     * Costruisce un Filter.Expression combinando in AND tutti i criteri presenti.
+     *
+     * Criteri standard: docId, fileName, chapter (→ campo "title").
+     * Criteri arbitrari: tutti i parametri query il cui nome inizia con "meta."
+     *   es. meta.sourceType=PDF  →  eq("sourceType", "PDF")
+     *       meta.pageNumber=3    →  eq("pageNumber", "3")
+     *
+     * Restituisce null se non è presente alcun criterio (= nessun filtro).
+     */
+    private Filter.Expression buildFilter(String docId, String fileName, String chapter,
+                                          Map<String, String> allParams) {
+        FilterExpressionBuilder b = new FilterExpressionBuilder();
+        List<FilterExpressionBuilder.Op> ops = new ArrayList<>();
+
+        if (docId    != null && !docId.isBlank())    ops.add(b.eq("docId",    docId));
+        if (fileName != null && !fileName.isBlank()) ops.add(b.eq("fileName", fileName));
+        if (chapter  != null && !chapter.isBlank())  ops.add(b.eq("title",    chapter));
+
+        allParams.entrySet().stream()
+                .filter(e -> e.getKey().startsWith("meta.") && !e.getValue().isBlank())
+                .forEach(e -> ops.add(b.eq(e.getKey().substring(5), e.getValue())));
+
+        if (ops.isEmpty()) return null;
+
+        FilterExpressionBuilder.Op combined = ops.get(0);
+        for (int i = 1; i < ops.size(); i++) {
+            combined = b.and(combined, ops.get(i));
+        }
+        return combined.build();
     }
 
     /**
