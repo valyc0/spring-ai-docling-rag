@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.SerializationFeature;
 import elastic.rag.model.DoclingResponse;
 import elastic.rag.model.DocumentInfo;
 import elastic.rag.model.UnifiedDocumentJson;
+import elastic.rag.summary.DocumentStoreService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
@@ -55,6 +56,7 @@ public class DoclingController {
     private final ElasticsearchVectorStore vectorStore;
     private final ElasticsearchClient      esClient;
     private final ChatClient               chatClient;
+    private final DocumentStoreService     documentStoreService;
 
     public DoclingController(RestTemplate doclingRestTemplate,
                              @Value("${docling.service.url}") String doclingUrl,
@@ -62,14 +64,16 @@ public class DoclingController {
                              DoclingNormalizerService normalizer,
                              ElasticsearchVectorStore vectorStore,
                              ElasticsearchClient esClient,
-                             ChatClient.Builder chatClientBuilder) {
-        this.doclingRestTemplate = doclingRestTemplate;
-        this.doclingUrl          = doclingUrl;
-        this.vectorStoreIndex    = vectorStoreIndex;
-        this.normalizer          = normalizer;
-        this.vectorStore         = vectorStore;
-        this.esClient            = esClient;
-        this.chatClient          = chatClientBuilder.build();
+                             ChatClient.Builder chatClientBuilder,
+                             DocumentStoreService documentStoreService) {
+        this.doclingRestTemplate  = doclingRestTemplate;
+        this.doclingUrl           = doclingUrl;
+        this.vectorStoreIndex     = vectorStoreIndex;
+        this.normalizer           = normalizer;
+        this.vectorStore          = vectorStore;
+        this.esClient             = esClient;
+        this.chatClient           = chatClientBuilder.build();
+        this.documentStoreService = documentStoreService;
     }
 
     /**
@@ -158,7 +162,40 @@ public class DoclingController {
         log.info("[CHUNKS] indicizzati {} chunk su Elasticsearch per docId={} — embedding+index in {} ms ({} ms/chunk)",
                 chunks.size(), docId, embMs, chunks.isEmpty() ? 0 : embMs / chunks.size());
 
+        documentStoreService.save(docId, unified);
+
         return ResponseEntity.ok(unified);
+    }
+
+    /**
+     * DELETE /docling/{docId}
+     *
+     * Elimina completamente un documento da tutti e tre gli indici Elasticsearch:
+     *  - chunk dal vector store (spring-ai-document-index)
+     *  - record dal document-store
+     *  - summary dall'summary-index (se presente)
+     *
+     * @return 200 con { docId, message }
+     *         404 se il documento non esiste nel document-store
+     */
+    @DeleteMapping("/{docId}")
+    public ResponseEntity<Map<String, Object>> deleteDocument(@PathVariable String docId) {
+        if (documentStoreService.findByDocId(docId).isEmpty()) {
+            log.warn("[DOCLING] DELETE: docId={} non trovato nel document-store", docId);
+            return ResponseEntity.notFound().build();
+        }
+        try {
+            documentStoreService.deleteDocument(docId);
+            log.info("[DOCLING] documento eliminato da tutti gli indici: docId={}", docId);
+            return ResponseEntity.ok(Map.of(
+                    "docId",   docId,
+                    "message", "Documento eliminato da vector store, document-store e summary-index"
+            ));
+        } catch (IOException e) {
+            log.error("[DOCLING] errore DELETE docId={}: {}", docId, e.getMessage(), e);
+            return ResponseEntity.internalServerError()
+                    .body(Map.of("error", "Errore durante la cancellazione: " + e.getMessage()));
+        }
     }
 
     /**

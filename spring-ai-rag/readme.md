@@ -1,36 +1,62 @@
 # spring-ai-rag
 
-Pipeline **RAG (Retrieval-Augmented Generation)** costruita con Spring Boot 3, Spring AI 1.0, Elasticsearch e Ollama.
+Pipeline **RAG (Retrieval-Augmented Generation)** con **Summary Service** integrato, costruita con Spring Boot 3, Spring AI 1.0, Elasticsearch e Ollama.
 
-Permette di caricare documenti PDF, indicizzarli come vettori su Elasticsearch tramite un modello di embedding locale, e interrogarli in linguaggio naturale con un LLM locale — tutto senza servizi cloud.
+Permette di caricare documenti (PDF, DOCX, HTML…), indicizzarli come vettori su Elasticsearch, interrogarli in linguaggio naturale con un LLM locale e generare riassunti automatici — tutto senza servizi cloud.
 
 ---
 
 ## Architettura
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        POST /docling/parse                       │
-│                                                                  │
-│  PDF ──► Docling Service ──► UnifiedDocumentJson                 │
-│              (FastAPI)           │                               │
-│                         TokenTextSplitter (400 token)            │
-│                         + overlap (200 char)                     │
-│                                  │                               │
-│                         nomic-embed-text (Ollama)                │
-│                                  │                               │
-│                         Elasticsearch (dense_vector 768d)        │
-└─────────────────────────────────────────────────────────────────┘
+POST /docling/parse
+  PDF/HTML/DOCX
+       │
+       ▼
+  Docling Service (FastAPI)
+       │ JSON strutturato
+       ▼
+  DoclingNormalizerService
+       │ UnifiedDocumentJson (sezioni semantiche)
+       │
+       ├──► TokenTextSplitter (400 token) + overlap (200 char)
+       │         │
+       │         ▼
+       │    nomic-embed-text (Ollama)  →  spring-ai-document-index (ES)
+       │
+       └──► DocumentStoreService  →  document-store (ES)
+                                      { UnifiedDocumentJson + summaryStatus }
 
-┌─────────────────────────────────────────────────────────────────┐
-│                        GET /docling/ask?q=                       │
-│                                                                  │
-│  Domanda ──► nomic-embed-text ──► kNN search (topK=8)           │
-│                                         │                        │
-│                                    top-K chunk                   │
-│                                         │                        │
-│                                   llama3.2:3b ──► Risposta       │
-└─────────────────────────────────────────────────────────────────┘
+GET /docling/ask?q=...
+  Domanda → nomic-embed-text → kNN topK=8 → gemma4:e2b → Risposta
+
+POST /summary/{docId}          [asincrono]
+  DocumentStoreService.findByDocId
+       │ UnifiedDocumentJson
+       ▼
+  SummaryService (@Async)
+       │
+       ├── STUFFING (testo < 6000 char): tutto in un prompt
+       │
+       └── MAP-REDUCE (testo > 6000 char):
+             Map:    ogni sezione → summary sezione  (via gemma4:e2b)
+             Reduce: tutti i section-summary → fullSummary
+             (Refine fallback se singola sezione > 3000 char)
+       │
+       ▼
+  summary-index (ES)  +  document-store status → COMPLETED
+
+GET /summary/{docId}
+  → status + fullSummary + sectionSummaries[]
+
+DELETE /summary/{docId}
+  → rimuove da summary-index + reset summaryStatus=NONE nel document-store
+
+DELETE /docling/{docId}
+  → deleteByQuery sul vector store + delete dal document-store + delete dal summary-index
+
+DELETE /admin/all
+  → deleteByQuery match_all su tutti e 3 gli indici (schema preservato)
 ```
 
 ### Componenti
@@ -39,35 +65,61 @@ Permette di caricare documenti PDF, indicizzarli come vettori su Elasticsearch t
 |---|---|---|
 | **Spring Boot 3.4** | Java 21 | Orchestrazione REST |
 | **Spring AI 1.0** | — | Astrazione embedding, vector store, LLM |
-| **Docling** (IBM) | FastAPI + Python | Parsing PDF → JSON strutturato |
+| **Docling** (IBM) | FastAPI + Python | Parsing PDF/DOCX/HTML → JSON strutturato |
 | **nomic-embed-text** | Ollama | Embedding 768 dimensioni |
-| **llama3.2:3b** | Ollama | Chat / generazione risposta |
-| **Elasticsearch 8.11** | — | Vector store (dense_vector kNN) |
+| **gemma4:e2b** | Ollama | Chat / RAG / Summary |
+| **Elasticsearch 8.11** | — | 3 indici: vector store, document-store, summary-index |
 | **Kibana 8.11** | — | Esplorazione indici (opzionale) |
+
+### Indici Elasticsearch
+
+| Indice | Contenuto |
+|---|---|
+| `spring-ai-document-index` | Chunk con embedding `dense_vector` 768d — creato all'avvio con `initialize-schema=true` |
+| `document-store` | `UnifiedDocumentJson` + stato summary (`NONE/PENDING/PROCESSING/COMPLETED/FAILED`) |
+| `summary-index` | `fullSummary` + `sectionSummaries[]` prodotti dall'LLM |
 
 ---
 
 ## Flusso di ingestione (`POST /docling/parse`)
 
-1. Il client carica un PDF via `multipart/form-data`
+1. Il client carica un file via `multipart/form-data`
 2. `DoclingController` invia il file al microservizio **Docling** (`http://localhost:8001/parse`)
-3. Docling restituisce il documento in formato JSON nativo con `texts`, `tables`, `pictures`
+3. Docling restituisce il documento in formato JSON nativo (`texts`, `tables`, `pictures`)
 4. `DoclingNormalizerService` trasforma il JSON in `UnifiedDocumentJson`:
    - raggruppa gli elementi per sezione (`section_header` / `title`)
    - accumula i testi (`text`, `paragraph`, `list_item`, `caption`)
    - estrae il numero di pagina da `prov[0].page_no`
-5. Ogni sezione viene convertita in un `Document` Spring AI con metadata (`docId`, `fileName`, `title`, `pageNumber`, `sourceType`)
+5. Ogni sezione diventa un `Document` Spring AI con metadata (`docId`, `fileName`, `title`, `pageNumber`, `sourceType`)
 6. `TokenTextSplitter` divide ogni sezione in chunk da **400 token**
 7. Viene aggiunto un **overlap di 200 caratteri** tra chunk consecutivi dello stesso documento
-8. `ElasticsearchVectorStore` calcola l'embedding di ogni chunk (`nomic-embed-text`) e lo salva su Elasticsearch
+8. `ElasticsearchVectorStore` calcola l'embedding di ogni chunk e lo salva in `spring-ai-document-index`
+9. `DocumentStoreService` salva l'`UnifiedDocumentJson` completo in `document-store` con `summaryStatus=NONE`
 
 ## Flusso di interrogazione (`GET /docling/ask?q=`)
 
 1. La domanda viene inviata al vector store come query kNN (`topK=8`)
 2. Elasticsearch restituisce i chunk più simili semanticamente
 3. I chunk vengono concatenati come contesto
-4. Il contesto + la domanda vengono passati a `llama3.2:3b` con un system prompt che vincola il modello a rispondere **solo** in base al contesto
+4. Il contesto + la domanda vengono passati a `gemma4:e2b` con un system prompt che vincola il modello a rispondere **solo** in base al contesto
 5. La risposta viene restituita al client
+
+## Flusso di summarization (`POST/GET /summary/{docId}`)
+
+1. `POST /summary/{docId}` — aggiorna `summaryStatus=PENDING` e lancia `SummaryService.generate()` in `@Async`
+2. Il service legge `UnifiedDocumentJson` da `document-store` (no re-chiamata a Docling)
+3. Seleziona la strategia in base al totale caratteri:
+   - **Stuffing** (≤ 6000 char): tutto in un prompt
+   - **Map-Reduce** (> 6000 char): riassume ogni sezione → combina i riassunti
+   - **Refine** (sezione singola > 3000 char): chunk incrementali prima della fase Map
+4. Scrive il risultato in `summary-index` e aggiorna `summaryStatus=COMPLETED`
+5. `GET /summary/{docId}` restituisce lo stato o il summary completo se `COMPLETED`
+
+## Flusso di cancellazione
+
+- **`DELETE /summary/{docId}`** — elimina il summary dall'`summary-index` e riporta `summaryStatus=NONE` nel `document-store`. Il documento rimane consultabile via `/docling/ask`.
+- **`DELETE /docling/{docId}`** — cancellazione completa: `deleteByQuery` sui chunk nel vector store, delete dal `document-store`, delete dal `summary-index`.
+- **`DELETE /admin/all`** — reset di tutti e tre gli indici con `deleteByQuery match_all`. Le mappature ES vengono preservate.
 
 ---
 
@@ -140,14 +192,27 @@ curl "http://localhost:8080/docling/ask?q=chi+è+Geppetto"
 
 Risposta: testo plain con la risposta generata dall'LLM.
 
-### Script di test (Pinocchio)
+### Avvia e leggi un summary
 
 ```bash
-# Indicizza pinocc_small.pdf
-./upload-pinocchio.sh
+# Avvia (asincrono, risponde subito con 202)
+curl -X POST http://localhost:8080/summary/<docId>
 
-# Fai una domanda
-./upload-pinocchio.sh ask "che attrezzo prese Mastr'Antonio?"
+# Polling stato / lettura risultato
+curl http://localhost:8080/summary/<docId>
+```
+
+### Eliminazione
+
+```bash
+# Elimina solo il summary (il doc resta nel vector store)
+curl -X DELETE http://localhost:8080/summary/<docId>
+
+# Elimina completamente un documento da tutti gli indici
+curl -X DELETE http://localhost:8080/docling/<docId>
+
+# Reset completo: elimina tutti i documenti (mappature preservate)
+curl -X DELETE http://localhost:8080/admin/all
 ```
 
 ---
@@ -178,16 +243,26 @@ docling.service.url=http://localhost:8001
 ```
 spring-ai-rag/
 ├── src/main/java/elastic/rag/
-│   ├── DemoApplication.java          # Entry point + RagService + RagController legacy
+│   ├── DemoApplication.java
 │   ├── config/
-│   │   └── DoclingClientConfig.java  # Bean RestTemplate per Docling
+│   │   ├── AsyncConfig.java           # @EnableAsync per SummaryService
+│   │   └── DoclingClientConfig.java   # Bean RestTemplate per Docling
 │   ├── docling/
-│   │   ├── DoclingController.java    # POST /docling/parse  GET /docling/ask
-│   │   └── DoclingNormalizerService.java  # JSON Docling → UnifiedDocumentJson
-│   └── model/
-│       ├── DoclingResponse.java      # Risposta raw Docling
-│       ├── UnifiedDocumentJson.java  # Formato normalizzato comune
-│       └── DocumentSection.java     # Singola sezione/capitolo
+│   │   ├── DoclingController.java     # POST /docling/parse  GET /docling/ask  DELETE /docling/{docId}
+│   │   └── DoclingNormalizerService.java
+│   ├── model/
+│   │   ├── DoclingResponse.java
+│   │   ├── DocumentRecord.java        # Record persistito in document-store
+│   │   ├── DocumentSection.java
+│   │   ├── DocumentSummary.java       # Persistito in summary-index
+│   │   ├── SectionSummary.java        # Output fase Map
+│   │   ├── SummaryStatus.java         # Enum NONE/PENDING/PROCESSING/COMPLETED/FAILED
+│   │   └── UnifiedDocumentJson.java
+│   └── summary/
+│       ├── AdminController.java       # DELETE /admin/all
+│       ├── DocumentStoreService.java  # CRUD document-store + delete multi-indice
+│       ├── SummaryController.java     # POST/GET/DELETE /summary/{docId}
+│       └── SummaryService.java        # Map-Reduce + Refine asincrono
 └── src/main/resources/
     └── application.properties
 ```
