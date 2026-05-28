@@ -34,6 +34,10 @@ import java.util.stream.Collectors;
  *                 → suddivide la sezione in sotto-chunk e aggiorna il
  *                   riassunto in modo incrementale prima della fase Map
  *
+ *   HIERARCHICAL REDUCE: se il numero di section-summary supera reduceMaxBatchSize
+ *                 → suddivide i summary in batch, riduce ogni batch a un summary
+ *                   intermedio, poi riduce ricorsivamente finché non resta 1 solo
+ *
  * La generazione è asincrona (@Async): il chiamante riceve subito una risposta
  * e il processo procede in background aggiornando lo stato nel document-store.
  */
@@ -49,6 +53,7 @@ public class SummaryService {
     private final String summaryIndex;
     private final int stuffingThresholdChars;
     private final int sectionRefineThresholdChars;
+    private final int reduceMaxBatchSize;
 
     public SummaryService(ChatClient.Builder chatClientBuilder,
                           DocumentStoreService documentStoreService,
@@ -56,7 +61,8 @@ public class SummaryService {
                           ObjectMapper objectMapper,
                           @Value("${summary.index-name:summary-index}") String summaryIndex,
                           @Value("${summary.stuffing-threshold-chars:6000}") int stuffingThresholdChars,
-                          @Value("${summary.section-refine-threshold-chars:3000}") int sectionRefineThresholdChars) {
+                          @Value("${summary.section-refine-threshold-chars:3000}") int sectionRefineThresholdChars,
+                          @Value("${summary.reduce-max-batch-size:10}") int reduceMaxBatchSize) {
         this.chatClient                  = chatClientBuilder.build();
         this.documentStoreService        = documentStoreService;
         this.esClient                    = esClient;
@@ -64,6 +70,11 @@ public class SummaryService {
         this.summaryIndex                = summaryIndex;
         this.stuffingThresholdChars      = stuffingThresholdChars;
         this.sectionRefineThresholdChars = sectionRefineThresholdChars;
+        if (reduceMaxBatchSize < 2) {
+            throw new IllegalArgumentException(
+                    "summary.reduce-max-batch-size deve essere >= 2, valore configurato: " + reduceMaxBatchSize);
+        }
+        this.reduceMaxBatchSize          = reduceMaxBatchSize;
     }
 
     /**
@@ -187,6 +198,11 @@ public class SummaryService {
         int start = 0;
         while (start < text.length()) {
             int end = Math.min(start + sectionRefineThresholdChars, text.length());
+            // snap a confine di parola: cerca l'ultimo spazio/newline prima del boundary
+            if (end < text.length()) {
+                int boundary = text.lastIndexOf(' ', end);
+                if (boundary > start) end = boundary + 1;
+            }
             chunks.add(text.substring(start, end));  // estrae il chunk
             if (end == text.length()) break;          // ultimo chunk: fermati
             start = end - overlap;                    // prossimo chunk parte <overlap> chars prima della fine
@@ -211,7 +227,7 @@ public class SummaryService {
                     
                     Rispondi con il riassunto aggiornato in italiano, in 3-5 punti chiave.
                     """.formatted(sectionLabel, currentSummary, chunks.get(i));
-            currentSummary = chatClient.prompt().user(prompt).call().content();  // sovrascrive, non appende
+            currentSummary = callLlm(prompt);  // sovrascrive, non appende
             log.info("[SUMMARY][REFINE] chunk {}/{} completato", i + 1, chunks.size());
         }
         return currentSummary;  // summary finale della sezione → entra nella fase Map come SectionSummary
@@ -223,16 +239,51 @@ public class SummaryService {
 
     /**
      * Fase Reduce: combina tutti i section-summary nel summary finale del documento.
+     * Se i summary sono più di reduceMaxBatchSize applica un hierarchical reduce ricorsivo:
+     * suddivide in batch → riduce ogni batch → riduce ricorsivamente i risultati intermedi.
      */
     private String reducePhase(List<SectionSummary> sectionSummaries, String fileName) {
         log.info("[SUMMARY][REDUCE] riduzione di {} section-summary per '{}'",
                 sectionSummaries.size(), fileName);
 
-        // Costruisce un unico testo con tutti i section-summary, uno per sezione
-        // Formato: "### Titolo sezione (pag. N)\n• punto 1\n• punto 2..."
-        // ⚠️ LIMITE ATTUALE: se il testo combinato supera la context window del modello
-        //    (es. documento con 50+ sezioni) questa singola chiamata LLM fallirà.
-        //    Soluzione futura: hierarchical reduce (riduzione a livelli ricorsivi)
+        if (sectionSummaries.size() <= reduceMaxBatchSize) {
+            // Batch abbastanza piccolo: reduce finale in 1 chiamata LLM
+            return reduceDirectly(sectionSummaries, fileName, true);
+        }
+
+        // HIERARCHICAL REDUCE: troppi summary per una singola chiamata LLM
+        // → suddivide in batch, riduce ogni batch a un summary intermedio,
+        //   poi chiama ricorsivamente reducePhase sui summary intermedi
+        int totalBatches = (int) Math.ceil((double) sectionSummaries.size() / reduceMaxBatchSize);
+        log.info("[SUMMARY][REDUCE] hierarchical reduce: {} sezioni → {} batch da max {}",
+                sectionSummaries.size(), totalBatches, reduceMaxBatchSize);
+
+        List<SectionSummary> intermediateSummaries = new ArrayList<>(totalBatches);
+        for (int b = 0; b < totalBatches; b++) {
+            int from = b * reduceMaxBatchSize;
+            int to   = Math.min(from + reduceMaxBatchSize, sectionSummaries.size());
+            List<SectionSummary> batch = sectionSummaries.subList(from, to);
+
+            String batchSummary = reduceDirectly(batch, fileName, false);  // riduce il batch a summary intermedio
+            intermediateSummaries.add(new SectionSummary(
+                    "reduce-batch-" + b,                             // id sintetico
+                    "Sezioni " + (from + 1) + "-" + to,             // titolo descrittivo
+                    null,                                            // nessuna pagina
+                    batchSummary
+            ));
+            log.info("[SUMMARY][REDUCE] batch {}/{} ridotto (sezioni {}-{})",
+                    b + 1, totalBatches, from + 1, to);
+        }
+
+        // Riduzione ricorsiva: i summary intermedi diventano input del prossimo livello
+        return reducePhase(intermediateSummaries, fileName);
+    }
+
+    /**
+     * Reduce diretto: costruisce un unico testo dai section-summary e chiama l'LLM una sola volta.
+     * Usato sia come caso base del hierarchical reduce sia per batch di dimensione <= reduceMaxBatchSize.
+     */
+    private String reduceDirectly(List<SectionSummary> sectionSummaries, String fileName, boolean isFinal) {
         String combined = sectionSummaries.stream()
                 .map(ss -> {
                     String header = ss.title() != null ? "### " + ss.title() : "### (senza titolo)";
@@ -241,7 +292,11 @@ public class SummaryService {
                 })
                 .collect(Collectors.joining("\n\n"));  // separa ogni section-summary con riga vuota
 
-        return callLlmForFullSummary(combined, fileName);  // 1 chiamata LLM → fullSummary del documento
+        // isFinal=true  → prompt strutturato per il summary definitivo del documento
+        // isFinal=false → prompt di merge intermedio (nessun paragrafo intro/conclusione fittizia)
+        return isFinal
+                ? callLlmForFullSummary(combined, fileName)
+                : callLlmForIntermediateMerge(combined);
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -258,7 +313,7 @@ public class SummaryService {
                 TESTO:
                 %s
                 """.formatted(label, text);
-        return chatClient.prompt().user(prompt).call().content();
+        return callLlm(prompt);
     }
 
     private String callLlmForFullSummary(String text, String fileName) {
@@ -272,7 +327,27 @@ public class SummaryService {
                 CONTENUTO:
                 %s
                 """.formatted(fileName, text);
-        return chatClient.prompt().user(prompt).call().content();
+        return callLlm(prompt);
+    }
+
+    private String callLlmForIntermediateMerge(String text) {
+        String prompt = """
+                Di seguito ci sono i riassunti di alcune sezioni di un documento.
+                Uniscili in un unico riassunto intermedio in italiano, in forma di elenco puntato (5-8 punti).
+                Mantieni solo le informazioni più importanti, eliminando ridondanze.
+                
+                SEZIONI:
+                %s
+                """.formatted(text);
+        return callLlm(prompt);
+    }
+
+    private String callLlm(String prompt) {
+        String content = chatClient.prompt().user(prompt).call().content();
+        if (content == null || content.isBlank()) {
+            throw new IllegalStateException("L'LLM ha restituito una risposta vuota o nulla");
+        }
+        return content;
     }
 
     // ──────────────────────────────────────────────────────────────────────────
